@@ -246,54 +246,73 @@ func (c *client) sendBatch(tenantID string, batch *batch) {
 	bufBytes := float64(len(buf))
 	encodedBytes.WithLabelValues(c.cfg.URL.Host).Add(bufBytes)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	backoff := util.NewBackoff(ctx, c.cfg.BackoffConfig)
 	var status int
-	for backoff.Ongoing() {
-		start := time.Now()
-		status, err = c.send(ctx, tenantID, buf)
-		requestDuration.WithLabelValues(strconv.Itoa(status), c.cfg.URL.Host).Observe(time.Since(start).Seconds())
 
-		if err == nil {
-			sentBytes.WithLabelValues(c.cfg.URL.Host).Add(bufBytes)
-			sentEntries.WithLabelValues(c.cfg.URL.Host).Add(float64(entriesCount))
-			for _, s := range batch.streams {
-				lbls, err := parser.ParseMetric(s.Labels)
-				if err != nil {
-					// is this possible?
-					level.Warn(c.logger).Log("msg", "error converting stream label string to label.Labels, cannot update lagging metric", "error", err)
-					return
-				}
-				var lblSet model.LabelSet
-				for i := range lbls {
-					if lbls[i].Name == LatencyLabel {
-						lblSet = model.LabelSet{
-							model.LabelName(HostLabel):    model.LabelValue(c.cfg.URL.Host),
-							model.LabelName(LatencyLabel): model.LabelValue(lbls[i].Value),
+	// instrument
+	defer func() {
+		if err != nil {
+			level.Error(c.logger).Log("msg", "final error sending batch", "status", status, "error", err)
+			droppedBytes.WithLabelValues(c.cfg.URL.Host).Add(bufBytes)
+			droppedEntries.WithLabelValues(c.cfg.URL.Host).Add(float64(entriesCount))
+		}
+	}()
+
+	var nextDelay time.Duration
+
+	// sendBatch can block till backoff.DelayMax. So need to multiplex with `c.quit` channel to propagate the client's stop.
+	for {
+		select {
+		case <-c.quit:
+			return
+		case <-time.After(nextDelay):
+
+			if !backoff.Ongoing() {
+				return
+			}
+
+			start := time.Now()
+			status, err = c.send(ctx, tenantID, buf)
+			requestDuration.WithLabelValues(strconv.Itoa(status), c.cfg.URL.Host).Observe(time.Since(start).Seconds())
+
+			if err == nil {
+				sentBytes.WithLabelValues(c.cfg.URL.Host).Add(bufBytes)
+				sentEntries.WithLabelValues(c.cfg.URL.Host).Add(float64(entriesCount))
+				for _, s := range batch.streams {
+					lbls, err := parser.ParseMetric(s.Labels)
+					if err != nil {
+						// is this possible?
+						level.Warn(c.logger).Log("msg", "error converting stream label string to label.Labels, cannot update lagging metric", "error", err)
+						return
+					}
+					var lblSet model.LabelSet
+					for i := range lbls {
+						if lbls[i].Name == LatencyLabel {
+							lblSet = model.LabelSet{
+								model.LabelName(HostLabel):    model.LabelValue(c.cfg.URL.Host),
+								model.LabelName(LatencyLabel): model.LabelValue(lbls[i].Value),
+							}
 						}
 					}
+					if lblSet != nil {
+						streamLag.With(lblSet).Set(time.Since(s.Entries[len(s.Entries)-1].Timestamp).Seconds())
+					}
 				}
-				if lblSet != nil {
-					streamLag.With(lblSet).Set(time.Since(s.Entries[len(s.Entries)-1].Timestamp).Seconds())
-				}
+				return
 			}
-			return
+
+			// Only retry 429s, 500s and connection-level errors.
+			if status > 0 && status != 429 && status/100 != 5 {
+				return
+			}
+
+			level.Warn(c.logger).Log("msg", "error sending batch, will retry", "status", status, "error", err)
+			batchRetries.WithLabelValues(c.cfg.URL.Host).Inc()
+			nextDelay = backoff.NextDelay()
 		}
-
-		// Only retry 429s, 500s and connection-level errors.
-		if status > 0 && status != 429 && status/100 != 5 {
-			break
-		}
-
-		level.Warn(c.logger).Log("msg", "error sending batch, will retry", "status", status, "error", err)
-		batchRetries.WithLabelValues(c.cfg.URL.Host).Inc()
-		backoff.Wait()
-	}
-
-	if err != nil {
-		level.Error(c.logger).Log("msg", "final error sending batch", "status", status, "error", err)
-		droppedBytes.WithLabelValues(c.cfg.URL.Host).Add(bufBytes)
-		droppedEntries.WithLabelValues(c.cfg.URL.Host).Add(float64(entriesCount))
 	}
 }
 
